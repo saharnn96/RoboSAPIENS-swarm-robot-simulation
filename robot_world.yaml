@@ -1,0 +1,91 @@
+world:
+  height: 10 # the height of the world
+  width: 10 # the width of the world
+  step_time: 0.1 # 10Hz calculate each step
+  sample_time: 0.1 # 10 Hz for render and data extraction
+  offset: [0, 0] # the offset of the world on x and y
+  collision_mode: "unobstructed" # 'stop', 'unobstructed', 'reactive', 'unobstructed_obstacles'
+  control_mode: "auto" # 'keyboard', 'auto'
+  # obstacle_map: 'cave.png'
+
+robot:
+  - number: 3
+    distribution: { name: "circle", radius: 4.0, center: [5, 5] }
+    kinematics: { name: "diff" }
+    shape:
+      - { name: "circle", radius: 0.2 } # radius
+    behavior:
+      {
+        name: "rvo_custom",
+        vxmax: 1.5,
+        vymax: 1.5,
+        accer: 1.0,
+        factor: 1.0,
+        wander: True,
+        range_low: [0, 0, -3.14],
+        range_high: [10, 10, 3.14],
+        angle_tolerance: 0.1,
+      }
+    # behavior: {name: 'dash_custom'}
+    vel_min: [-5, -5.0]
+    vel_max: [5, 5.0]
+    color: "cyan"
+    arrive_mode: position
+    goal_threshold: 1.0
+    sensors:
+      - type: "lidar2d"
+        range_min: 0
+        range_max: 5
+        angle_range: 3.14 #  4.7123
+        number: 200
+        noise: True
+        std: 0.1
+        angle_std: 0.2
+        offset: [0, 0, 0]
+        alpha: 0.3
+    fov: 1.57
+    fov_radius: 2.0
+
+    plot:
+      show_trail: false
+      show_goal: true
+      trail_fill: true
+      trail_alpha: 0.2
+      show_trajectory: false
+      show_fov: true
+  - number: 3
+    distribution: { name: "random" }
+    kinematics: { name: "diff" }
+    shape:
+      - { name: "circle", radius: 0.2 } # radius
+    behavior:
+      {
+        name: "rvo",
+        wander: True,
+        range_low: [0, 0, -3.14],
+        range_high: [10, 10, 3.14],
+        angle_tolerance: 0.1,
+      }
+    # behavior: {name: 'rvo_custom'}
+    vel_min: [-3, -3.0]
+    vel_max: [3, 3.0]
+    color:
+      - "pink"
+    fov: 2.6
+    fov_radius: 1.5
+    plot:
+      goal_color: "purple"
+      show_text: False
+      show_goal: True
+      # show_fov: True
+# obstacle:
+#   - number:
+#     distribution: { name: "manual" }
+#     state: [[4, 8], [8, 3], [7, 8], [5, 2]]
+#     shape:
+#       - { name: "rectangle", length: 0.5, width: 4 } # length, width
+#       - { name: "rectangle", length: 3, width: 1 } # length, width
+#       - { name: "rectangle", length: 4, width: 0.8 } # length, width
+#       - { name: "rectangle", length: 1, width: 2 } # length, width
+
+#     color: "k"

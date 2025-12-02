@@ -1,14 +1,16 @@
 import irsim
 
-env = irsim.make("world.yaml")
+import irsim
 
-for _i in range(200):
+env = irsim.make('robot_world.yaml')
+env.load_behavior("custom_behavior_methods")
+
+for i in range(1500):
+
     env.step()
+    env.render(0.1)
+    if env.done():
+        break
 
-    for obs in env.obstacle_list:
-        if obs.fov_detect_object(env.robot):
-            print(
-                f"The robot is in the FOV of the {obs.name}. The parameters of this obstacle are: state [x, y, theta]: {obs.state.flatten()}, velocity [linear, angular]: {obs.velocity.flatten()}, fov in radian: {obs.fov}."
-            )
+env.end(3)
 
-    env.render(figure_kwargs={"dpi": 100})
