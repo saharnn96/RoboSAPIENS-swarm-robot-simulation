@@ -1,29 +1,49 @@
 """
 maplek_loop.py  –  self-adaptive path planning loop
 
-Subscribes to : path_maker:events   (init / obstacle messages)
-Publishes to  : maplek_loop:paths   (new waypoints for each pair)
+Subscribes (ROS2-style topics via Redis):
+  /map                       nav_msgs/OccupancyGrid  – inflated obstacle grid
+  /robot_poses               geometry_msgs/PoseArray – robot start positions
+  /goal_poses                geometry_msgs/PoseArray – robot goal positions
+  /human_obstacle            PoseWithVelocity        – moving obstacle with velocity
+  /system/quit               –                       – shutdown signal
 
-Start this before path_maker.py.
+Publishes (ROS2-style topics via Redis):
+  /robot_N/follow_waypoints  nav_msgs/Path           – planned path per robot (N=1,2,3)
+
+Paths are (re)computed whenever all three of /map, /robot_poses, /goal_poses have
+been received.  Each /human_obstacle message triggers a grid update and rereroutes
+only the robots whose current paths pass through the newly blocked cells.
 """
 
 import base64
 import heapq
 import json
+import time
 
 import numpy as np
 import redis
 
-WORLD_SIZE  = 10.0
-GRID_SIZE   = 200
-BLOCK_SIZE  = 0.5
-MIN_AB_DIST = 3.5
-MIN_PT_DIST = 1.5
+WORLD_SIZE = 10.0
+GRID_SIZE  = 200
+BLOCK_SIZE = 0.5
+NUM_ROBOTS = 3
 
 REDIS_HOST = 'localhost'
 REDIS_PORT = 6379
-CH_EVENTS  = 'path_maker:events'   # subscribe here
-CH_PATHS   = 'maplek_loop:paths'   # publish here
+
+# ── topic names (mirrors ROS2 topic convention) ───────────────────────────────
+T_MAP         = '/map'
+T_ROBOT_POSES = '/robot_poses'
+T_GOAL_POSES  = '/goal_poses'
+T_HUMAN_OBS   = '/human_obstacle'
+T_QUIT        = '/system/quit'
+T_WAYPOINTS   = [f'/robot_{i+1}/follow_waypoints' for i in range(NUM_ROBOTS)]
+
+# ── Redis keys written by path_maker (read on late startup) ───────────────────
+K_MAP         = 'state:map'
+K_ROBOT_POSES = 'state:robot_poses'
+K_GOAL_POSES  = 'state:goal_poses'
 
 _MOVES = [
     (-1, -1, 1.414), (-1, 0, 1.0), (-1, 1, 1.414),
@@ -31,6 +51,9 @@ _MOVES = [
     ( 1, -1, 1.414), ( 1, 0, 1.0), ( 1, 1, 1.414),
 ]
 
+
+def _now():
+    return time.time()
 
 
 def w2g(wx, wy):
@@ -77,16 +100,45 @@ class MaplekLoop:
     def __init__(self):
         self.base_grid    = None
         self.working_grid = None
-        self.pairs         = []
-        self.current_paths = []
+        self.robot_poses  = {}   # robot_id → (x, y)
+        self.goal_poses   = {}   # robot_id → (x, y)
+        self.current_paths = {}  # robot_id → grid-coord path (or None)
+
+        # readiness flags — all three must be True before paths are computed
+        self._map_ready   = False
+        self._poses_ready = False
+        self._goals_ready = False
 
         self._redis  = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
         self._pubsub = self._redis.pubsub(ignore_subscribe_messages=True)
-        self._pubsub.subscribe(CH_EVENTS)
+        self._pubsub.subscribe(T_MAP, T_ROBOT_POSES, T_GOAL_POSES, T_HUMAN_OBS, T_QUIT)
 
-        print(f'[MaplekLoop] Subscribed to "{CH_EVENTS}", publishing on "{CH_PATHS}"')
-        print('[MaplekLoop] Waiting for path_maker...')
+        print('[MaplekLoop] Subscribed to:')
+        for t in (T_MAP, T_ROBOT_POSES, T_GOAL_POSES, T_HUMAN_OBS, T_QUIT):
+            print(f'  SUB  {t}')
+        for t in T_WAYPOINTS:
+            print(f'  PUB  {t}')
+
+        self._load_cached_state()
         self._run()
+
+    def _load_cached_state(self):
+        """Read state keys written by path_maker so we can start in any order."""
+        raw_map   = self._redis.get(K_MAP)
+        raw_poses = self._redis.get(K_ROBOT_POSES)
+        raw_goals = self._redis.get(K_GOAL_POSES)
+
+        if raw_map and raw_poses and raw_goals:
+            print('[MaplekLoop] Cached state found — loading without waiting for path_maker.')
+            self._on_map(json.loads(raw_map))
+            self._on_robot_poses(json.loads(raw_poses))
+            self._on_goal_poses(json.loads(raw_goals))
+        else:
+            missing = [k for k, v in
+                       ((K_MAP, raw_map), (K_ROBOT_POSES, raw_poses), (K_GOAL_POSES, raw_goals))
+                       if not v]
+            print(f'[MaplekLoop] No cached state ({", ".join(missing)} missing). '
+                  'Waiting for path_maker...')
 
     # ── main loop ─────────────────────────────────────────────────────────────
 
@@ -95,7 +147,7 @@ class MaplekLoop:
             for msg in self._pubsub.listen():
                 if msg and msg['type'] == 'message':
                     try:
-                        self._dispatch(json.loads(msg['data']))
+                        self._dispatch(msg['channel'], json.loads(msg['data']))
                     except Exception as e:
                         print(f'[MaplekLoop] error: {e}')
         except KeyboardInterrupt:
@@ -109,64 +161,81 @@ class MaplekLoop:
         self._redis.close()
         print('[MaplekLoop] Bye.')
 
-    def _dispatch(self, msg):
-        t = msg.get('type')
-        if t == 'init':
-            self._on_init(msg)
-        elif t == 'obstacle':
-            self._on_obstacle(msg['x'], msg['y'])
-        elif t == 'quit':
-            raise KeyboardInterrupt
+    def _dispatch(self, channel, msg):
+        if   channel == T_MAP:         self._on_map(msg)
+        elif channel == T_ROBOT_POSES: self._on_robot_poses(msg)
+        elif channel == T_GOAL_POSES:  self._on_goal_poses(msg)
+        elif channel == T_HUMAN_OBS:   self._on_human_obstacle(msg)
+        elif channel == T_QUIT:        raise KeyboardInterrupt
 
-    def _publish(self, payload):
-        self._redis.publish(CH_PATHS, json.dumps(payload))
+    # ── topic publisher ───────────────────────────────────────────────────────
 
-    # ── event handlers ────────────────────────────────────────────────────────
+    def _publish_waypoints(self, robot_id, path):
+        poses = [{'x': x, 'y': y} for x, y in
+                 (g2w(r, c) for r, c in path)] if path else []
+        self._redis.publish(T_WAYPOINTS[robot_id - 1], json.dumps({
+            'header':   {'stamp': _now(), 'frame_id': 'map'},
+            'robot_id': robot_id,
+            'poses':    poses,
+        }))
 
-    def _random_free_point(self, avoid_pts, min_dist):
-        rng = np.random.default_rng()
-        for _ in range(20_000):
-            wx = rng.uniform(0.5, WORLD_SIZE - 0.5)
-            wy = rng.uniform(0.5, WORLD_SIZE - 0.5)
-            if self.base_grid[w2g(wx, wy)]:
-                continue
-            if any(np.hypot(wx - px, wy - py) < min_dist for px, py in avoid_pts):
-                continue
-            return wx, wy
-        raise RuntimeError('Could not place B point — map too cluttered.')
+    # ── topic handlers ────────────────────────────────────────────────────────
 
-    def _on_init(self, msg):
-        shape = tuple(msg['grid_shape'])
-        self.base_grid = np.frombuffer(
-            base64.b64decode(msg['grid']), dtype=np.uint8
+    def _on_map(self, msg):
+        shape = tuple(msg['data_shape'])
+        self.base_grid    = np.frombuffer(
+            base64.b64decode(msg['data']), dtype=np.uint8
         ).reshape(shape).copy()
         self.working_grid = self.base_grid.copy()
+        self.current_paths.clear()
+        # reset pose flags so paths are recomputed once new poses also arrive
+        self._map_ready   = True
+        self._poses_ready = False
+        self._goals_ready = False
+        print(f'[MaplekLoop] /map received  '
+              f'({msg["info"]["width"]}×{msg["info"]["height"]} '
+              f'@ {msg["info"]["resolution"]:.3f} m/cell) — grid reset.')
+        self._try_compute_paths()
 
-        a_points = [(pt[0], pt[1]) for pt in msg['a_points']]
-        self.pairs = []
-        all_pts = list(a_points)
-        for a_pt in a_points:
-            b = self._random_free_point(all_pts, max(MIN_AB_DIST, MIN_PT_DIST))
-            while np.hypot(a_pt[0] - b[0], a_pt[1] - b[1]) < MIN_AB_DIST:
-                b = self._random_free_point(all_pts, MIN_PT_DIST)
-            all_pts.append(b)
-            self.pairs.append((a_pt, b))
+    def _on_robot_poses(self, msg):
+        self.robot_poses  = {p['robot_id']: (p['x'], p['y']) for p in msg['poses']}
+        self._poses_ready = True
+        print(f'[MaplekLoop] /robot_poses received — '
+              + ', '.join(f'R{r}=({x:.2f},{y:.2f})' for r,(x,y) in self.robot_poses.items()))
+        self._try_compute_paths()
 
-        self.current_paths = []
-        for i, (a_pt, b_pt) in enumerate(self.pairs):
-            path = astar(self.working_grid, w2g(*a_pt), w2g(*b_pt))
-            self.current_paths.append(path)
-            waypoints = [list(g2w(r, c)) for r, c in path] if path else []
-            self._publish({
-                'type': 'new_path',
-                'pair_id': i,
-                'b_point': list(b_pt),
-                'waypoints': waypoints,
-            })
-            status = f'{len(waypoints)} waypoints' if waypoints else 'blocked'
-            print(f'[MaplekLoop] Pair {i+1} → B{i+1} placed, path: {status}')
+    def _on_goal_poses(self, msg):
+        self.goal_poses   = {g['robot_id']: (g['x'], g['y']) for g in msg['goals']}
+        self._goals_ready = True
+        print(f'[MaplekLoop] /goal_poses received  — '
+              + ', '.join(f'G{r}=({x:.2f},{y:.2f})' for r,(x,y) in self.goal_poses.items()))
+        self._try_compute_paths()
 
-    def _on_obstacle(self, wx, wy):
+    def _try_compute_paths(self):
+        if not (self._map_ready and self._poses_ready and self._goals_ready):
+            return
+        print('[MaplekLoop] All data ready — computing initial paths...')
+        self.current_paths.clear()
+        for robot_id in sorted(self.robot_poses):
+            if robot_id not in self.goal_poses:
+                continue
+            path = astar(self.working_grid,
+                         w2g(*self.robot_poses[robot_id]),
+                         w2g(*self.goal_poses[robot_id]))
+            self.current_paths[robot_id] = path
+            self._publish_waypoints(robot_id, path)
+            status = f'{len(path)} waypoints' if path else 'blocked'
+            print(f'[MaplekLoop] Robot {robot_id} → {status}')
+
+    def _on_human_obstacle(self, msg):
+        wx = msg['pose']['x']
+        wy = msg['pose']['y']
+        vx = msg['velocity']['vx']
+        vy = msg['velocity']['vy']
+        print(f'[MaplekLoop] /human_obstacle at ({wx:.2f}, {wy:.2f})  '
+              f'vel=({vx:.2f}, {vy:.2f})')
+
+        # mark obstacle cells in working grid
         half = BLOCK_SIZE / 2
         r0, c0 = w2g(wx - half, wy + half)
         r1, c1 = w2g(wx + half, wy - half)
@@ -174,16 +243,15 @@ class MaplekLoop:
         c0, c1 = min(c0, c1), max(c0, c1) + 1
         self.working_grid[r0:r1, c0:c1] = 1
 
-        for i, path in enumerate(self.current_paths):
+        for robot_id, path in list(self.current_paths.items()):
             if path is None or self._path_blocked(path):
-                print(f'[MaplekLoop] Pair {i+1} path blocked — rerouting...')
-                a_pt, b_pt = self.pairs[i]
-                new_path = astar(self.working_grid, w2g(*a_pt), w2g(*b_pt))
-                self.current_paths[i] = new_path
-                waypoints = [list(g2w(r, c)) for r, c in new_path] if new_path else []
-                self._publish({'type': 'new_path', 'pair_id': i, 'waypoints': waypoints})
-                status = f'{len(waypoints)} waypoints' if waypoints else 'blocked'
-                print(f'[MaplekLoop] Pair {i+1} new path: {status}')
+                new_path = astar(self.working_grid,
+                                 w2g(*self.robot_poses[robot_id]),
+                                 w2g(*self.goal_poses[robot_id]))
+                self.current_paths[robot_id] = new_path
+                self._publish_waypoints(robot_id, new_path)
+                status = f'{len(new_path)} waypoints' if new_path else 'blocked'
+                print(f'[MaplekLoop] Robot {robot_id} rerouted → {status}')
 
     def _path_blocked(self, path):
         return any(self.working_grid[r, c] for r, c in path)
