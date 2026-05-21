@@ -7,6 +7,7 @@ Subscribes to : maplek_loop:paths   (new waypoints from the planner)
 Start order: launch maplek_loop.py first, then this file.
 """
 
+import base64
 import json
 import queue
 import threading
@@ -64,8 +65,9 @@ class PathMaker:
         self._path_artists     = []
         self._block_artists    = []
         self._endpoint_artists = []
-        self.pairs             = []
-        self.current_paths     = [None, None, None]
+        self.a_points      = []
+        self.b_points      = [None, None, None]
+        self.current_paths = [None, None, None]
 
         self._msg_queue = queue.Queue()
 
@@ -114,13 +116,20 @@ class PathMaker:
         self._timer.start()
 
     def _drain_queue(self):
-        updated = False
+        updated_paths = False
+        updated_endpoints = False
         while not self._msg_queue.empty():
             msg = self._msg_queue.get_nowait()
             if msg.get('type') == 'new_path':
-                self.current_paths[msg['pair_id']] = msg['waypoints']
-                updated = True
-        if updated:
+                i = msg['pair_id']
+                self.current_paths[i] = msg['waypoints']
+                if 'b_point' in msg and self.b_points[i] != msg['b_point']:
+                    self.b_points[i] = msg['b_point']
+                    updated_endpoints = True
+                updated_paths = True
+        if updated_endpoints:
+            self._draw_endpoints()
+        if updated_paths:
             self._redraw_paths()
 
     # ── endpoints ─────────────────────────────────────────────────────────────
@@ -138,24 +147,26 @@ class PathMaker:
         raise RuntimeError('Could not place point — map too cluttered.')
 
     def _randomize_endpoints(self):
-        self.pairs.clear()
+        self.a_points.clear()
+        self.b_points      = [None, None, None]
         self.current_paths = [None, None, None]
         all_pts = []
         for _ in range(3):
             a = self._random_free_point(all_pts, MIN_PT_DIST)
             all_pts.append(a)
-            b = self._random_free_point(all_pts + [a], max(MIN_AB_DIST, MIN_PT_DIST))
-            while np.hypot(a[0] - b[0], a[1] - b[1]) < MIN_AB_DIST:
-                b = self._random_free_point(all_pts + [a], MIN_PT_DIST)
-            all_pts.append(b)
-            self.pairs.append((a, b))
+            self.a_points.append(a)
 
         self._clear_paths()
         self._draw_endpoints()
         self.fig.canvas.draw_idle()
 
-        pairs_data = [[[a[0], a[1]], [b[0], b[1]]] for a, b in self.pairs]
-        self._publish({'type': 'init', 'pairs': pairs_data})
+        grid_b64 = base64.b64encode(self.base_grid.tobytes()).decode('ascii')
+        self._publish({
+            'type': 'init',
+            'a_points': [[a[0], a[1]] for a in self.a_points],
+            'grid': grid_b64,
+            'grid_shape': list(self.base_grid.shape),
+        })
 
     # ── drawing ───────────────────────────────────────────────────────────────
 
@@ -163,19 +174,23 @@ class PathMaker:
         for art in self._endpoint_artists:
             art.remove()
         self._endpoint_artists.clear()
-        for i, ((ax_w, ay_w), (bx_w, by_w)) in enumerate(self.pairs):
-            ca, cb, _ = PAIR_STYLES[i]
-            n = i + 1
-            for wx, wy, color, label, marker in [
-                (ax_w, ay_w, ca, f'A{n}', 'o'),
-                (bx_w, by_w, cb, f'B{n}', 's'),
-            ]:
-                mk, = self.ax.plot(wx, wy, marker, color=color, markersize=13,
-                                   zorder=8, markeredgecolor='white',
-                                   markeredgewidth=1.8)
-                tx = self.ax.text(wx + 0.15, wy + 0.15, label, color=color,
-                                  fontsize=11, fontweight='bold', zorder=9)
-                self._endpoint_artists.extend([mk, tx])
+        for i, (ax_w, ay_w) in enumerate(self.a_points):
+            ca, _, _ = PAIR_STYLES[i]
+            mk, = self.ax.plot(ax_w, ay_w, 'o', color=ca, markersize=13,
+                               zorder=8, markeredgecolor='white', markeredgewidth=1.8)
+            tx = self.ax.text(ax_w + 0.15, ay_w + 0.15, f'A{i+1}', color=ca,
+                              fontsize=11, fontweight='bold', zorder=9)
+            self._endpoint_artists.extend([mk, tx])
+        for i, b_pt in enumerate(self.b_points):
+            if b_pt is None:
+                continue
+            _, cb, _ = PAIR_STYLES[i]
+            bx_w, by_w = b_pt
+            mk, = self.ax.plot(bx_w, by_w, 's', color=cb, markersize=13,
+                               zorder=8, markeredgecolor='white', markeredgewidth=1.8)
+            tx = self.ax.text(bx_w + 0.15, by_w + 0.15, f'B{i+1}', color=cb,
+                              fontsize=11, fontweight='bold', zorder=9)
+            self._endpoint_artists.extend([mk, tx])
 
     def _clear_paths(self):
         for art in self._path_artists:
@@ -232,6 +247,7 @@ class PathMaker:
             self._block_artists.clear()
             self._randomize_endpoints()
         elif key == 'q':
+            self._publish({'type': 'quit'})
             self._pubsub.unsubscribe()
             self._redis.close()
             plt.close(self.fig)

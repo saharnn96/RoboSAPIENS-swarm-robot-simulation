@@ -7,19 +7,18 @@ Publishes to  : maplek_loop:paths   (new waypoints for each pair)
 Start this before path_maker.py.
 """
 
+import base64
 import heapq
 import json
 
 import numpy as np
 import redis
-from PIL import Image
-from scipy.ndimage import binary_dilation
 
-MAP_FILE     = 'robot_map.png'
-WORLD_SIZE   = 10.0
-GRID_SIZE    = 200
-ROBOT_RADIUS = 0.15
-BLOCK_SIZE   = 0.5
+WORLD_SIZE  = 10.0
+GRID_SIZE   = 200
+BLOCK_SIZE  = 0.5
+MIN_AB_DIST = 3.5
+MIN_PT_DIST = 1.5
 
 REDIS_HOST = 'localhost'
 REDIS_PORT = 6379
@@ -32,17 +31,6 @@ _MOVES = [
     ( 1, -1, 1.414), ( 1, 0, 1.0), ( 1, 1, 1.414),
 ]
 
-
-def load_map():
-    img = Image.open(MAP_FILE).convert('L')
-    small = np.array(img.resize((GRID_SIZE, GRID_SIZE), Image.LANCZOS))
-    occupied = (small < 128).astype(np.uint8)
-    rc = int(ROBOT_RADIUS * GRID_SIZE / WORLD_SIZE)
-    if rc > 0:
-        occupied = binary_dilation(
-            occupied, structure=np.ones((2 * rc + 1, 2 * rc + 1))
-        ).astype(np.uint8)
-    return occupied
 
 
 def w2g(wx, wy):
@@ -87,8 +75,8 @@ def astar(grid, start, goal):
 
 class MaplekLoop:
     def __init__(self):
-        self.base_grid    = load_map()
-        self.working_grid = self.base_grid.copy()
+        self.base_grid    = None
+        self.working_grid = None
         self.pairs         = []
         self.current_paths = []
 
@@ -103,39 +91,80 @@ class MaplekLoop:
     # ── main loop ─────────────────────────────────────────────────────────────
 
     def _run(self):
-        for msg in self._pubsub.listen():
-            if msg and msg['type'] == 'message':
-                try:
-                    self._dispatch(json.loads(msg['data']))
-                except Exception as e:
-                    print(f'[MaplekLoop] error: {e}')
+        try:
+            for msg in self._pubsub.listen():
+                if msg and msg['type'] == 'message':
+                    try:
+                        self._dispatch(json.loads(msg['data']))
+                    except Exception as e:
+                        print(f'[MaplekLoop] error: {e}')
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._shutdown()
+
+    def _shutdown(self):
+        print('[MaplekLoop] Shutting down...')
+        self._pubsub.unsubscribe()
+        self._redis.close()
+        print('[MaplekLoop] Bye.')
 
     def _dispatch(self, msg):
         t = msg.get('type')
         if t == 'init':
-            self._on_init(msg['pairs'])
+            self._on_init(msg)
         elif t == 'obstacle':
             self._on_obstacle(msg['x'], msg['y'])
+        elif t == 'quit':
+            raise KeyboardInterrupt
 
     def _publish(self, payload):
         self._redis.publish(CH_PATHS, json.dumps(payload))
 
     # ── event handlers ────────────────────────────────────────────────────────
 
-    def _on_init(self, pairs_data):
+    def _random_free_point(self, avoid_pts, min_dist):
+        rng = np.random.default_rng()
+        for _ in range(20_000):
+            wx = rng.uniform(0.5, WORLD_SIZE - 0.5)
+            wy = rng.uniform(0.5, WORLD_SIZE - 0.5)
+            if self.base_grid[w2g(wx, wy)]:
+                continue
+            if any(np.hypot(wx - px, wy - py) < min_dist for px, py in avoid_pts):
+                continue
+            return wx, wy
+        raise RuntimeError('Could not place B point — map too cluttered.')
+
+    def _on_init(self, msg):
+        shape = tuple(msg['grid_shape'])
+        self.base_grid = np.frombuffer(
+            base64.b64decode(msg['grid']), dtype=np.uint8
+        ).reshape(shape).copy()
         self.working_grid = self.base_grid.copy()
-        self.pairs = [
-            ((row[0][0], row[0][1]), (row[1][0], row[1][1]))
-            for row in pairs_data
-        ]
+
+        a_points = [(pt[0], pt[1]) for pt in msg['a_points']]
+        self.pairs = []
+        all_pts = list(a_points)
+        for a_pt in a_points:
+            b = self._random_free_point(all_pts, max(MIN_AB_DIST, MIN_PT_DIST))
+            while np.hypot(a_pt[0] - b[0], a_pt[1] - b[1]) < MIN_AB_DIST:
+                b = self._random_free_point(all_pts, MIN_PT_DIST)
+            all_pts.append(b)
+            self.pairs.append((a_pt, b))
+
         self.current_paths = []
         for i, (a_pt, b_pt) in enumerate(self.pairs):
             path = astar(self.working_grid, w2g(*a_pt), w2g(*b_pt))
             self.current_paths.append(path)
             waypoints = [list(g2w(r, c)) for r, c in path] if path else []
-            self._publish({'type': 'new_path', 'pair_id': i, 'waypoints': waypoints})
-            print(f'[MaplekLoop] Pair {i+1} initial path: '
-                  f'{len(waypoints)} waypoints' if waypoints else f'Pair {i+1}: blocked')
+            self._publish({
+                'type': 'new_path',
+                'pair_id': i,
+                'b_point': list(b_pt),
+                'waypoints': waypoints,
+            })
+            status = f'{len(waypoints)} waypoints' if waypoints else 'blocked'
+            print(f'[MaplekLoop] Pair {i+1} → B{i+1} placed, path: {status}')
 
     def _on_obstacle(self, wx, wy):
         half = BLOCK_SIZE / 2
