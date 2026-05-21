@@ -1,12 +1,12 @@
 world:
   height: 10 # the height of the world
   width: 10 # the width of the world
-  step_time: 0.1 # 10Hz calculate each step
-  sample_time: 0.1 # 10 Hz for render and data extraction
+  step_time: 0.2 # 5Hz calculate each step
+  sample_time: 0.2 # 5 Hz for render and data extraction
   offset: [0, 0] # the offset of the world on x and y
-  collision_mode: "unobstructed" # 'stop', 'unobstructed', 'reactive', 'unobstructed_obstacles'
+  collision_mode: "stop" # 'stop', 'unobstructed', 'reactive', 'unobstructed_obstacles'
   control_mode: "auto" # 'keyboard', 'auto'
-  # obstacle_map: 'cave.png'
+  obstacle_map: 'robot_map.png'
 
 robot:
   - number: 3
@@ -53,7 +53,7 @@ robot:
       trail_alpha: 0.2
       show_trajectory: false
       show_fov: true
-  - number: 3
+  - number: 1
     distribution: { name: "random" }
     kinematics: { name: "diff" }
     shape:
