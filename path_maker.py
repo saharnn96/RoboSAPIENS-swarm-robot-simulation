@@ -283,20 +283,34 @@ class PathMaker:
         self.ax.set_title('  |  '.join(lengths), fontsize=10)
         self.fig.canvas.draw_idle()
 
+    # ── drawing helpers ───────────────────────────────────────────────────────
+
+    def _draw_human(self, wx, wy):
+        """Draw a stick figure centred on (wx, wy). Returns a list of artists."""
+        s = BLOCK_SIZE
+        kw = dict(color='#2c3e50', linewidth=2.5, zorder=6, solid_capstyle='round')
+        artists = []
+
+        head = mpatches.Circle((wx, wy + s * 0.42), radius=s * 0.16,
+                                facecolor='#2c3e50', edgecolor='#7f8c8d',
+                                linewidth=1.5, zorder=6)
+        self.ax.add_patch(head)
+        artists.append(head)
+
+        body,  = self.ax.plot([wx,            wx           ], [wy + s * 0.26, wy - s * 0.10], **kw)
+        arms,  = self.ax.plot([wx - s * 0.32, wx + s * 0.32], [wy + s * 0.10, wy + s * 0.10], **kw)
+        l_leg, = self.ax.plot([wx,            wx - s * 0.22], [wy - s * 0.10, wy - s * 0.44], **kw)
+        r_leg, = self.ax.plot([wx,            wx + s * 0.22], [wy - s * 0.10, wy - s * 0.44], **kw)
+        artists.extend([body, arms, l_leg, r_leg])
+        return artists
+
     # ── event handlers ────────────────────────────────────────────────────────
 
     def _on_click(self, event):
         if event.inaxes != self.ax:
             return
         wx, wy = event.xdata, event.ydata
-        half = BLOCK_SIZE / 2
-        rect = mpatches.FancyBboxPatch(
-            (wx - half, wy - half), BLOCK_SIZE, BLOCK_SIZE,
-            boxstyle='square,pad=0', facecolor='#2c3e50',
-            edgecolor='#7f8c8d', linewidth=1, zorder=6
-        )
-        self.ax.add_patch(rect)
-        self._block_artists.append(rect)
+        self._block_artists.extend(self._draw_human(wx, wy))
         self.fig.canvas.draw_idle()
 
         # publish human obstacle — velocity is zero for a static click;
